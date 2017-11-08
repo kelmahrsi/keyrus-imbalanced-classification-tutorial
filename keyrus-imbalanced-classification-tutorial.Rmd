@@ -1,0 +1,324 @@
+---
+title: "Handling Extreme Class Imbalances in Binary Classification"
+subtitle: A Short Tutorial in `R` and `Caret`
+author: Khalil El Mahrsi
+date: 2017-09-27 (v.1.0)
+output: html_notebook
+---
+
+This short tutorial is intended to illustrate some strategies that can be put in place in order to improve classification results in the presence of an extreme class imbalance.
+
+The content of the tutorial is largly inspired by the following (excellent) online resources that the interested reader is invited to read in order to go further on the subject:
+
+- [Simple guide to confusion matrix terminology](http://www.dataschool.io/simple-guide-to-confusion-matrix-terminology/)
+- [Handling Class Imbalance with R and Caret - An Introduction](http://dpmartin42.github.io/blogposts/r/imbalanced-classes-part-1)
+- [Handling Class Imbalance with R and Caret - Caveats when using the AUC](http://dpmartin42.github.io/blogposts/r/imbalanced-classes-part-2)
+- [Learning from Imbalanced Classes](https://www.svds.com/learning-imbalanced-classes/)
+
+## Generating the Dataset
+
+Let's start by loading the packages we're going to use.
+
+```{r, message = FALSE}
+library(plyr) # for efficient manipulation of datasets
+library(dplyr) # for efficient manipulation of datasets
+library(purrr) # for mapping
+library(doParallel) # for parallel  processing
+library(caret) # for pipelining the creation of predictive models
+library(gbm) # for training GBM models
+library(PRROC) # for measuring performances
+library(ggplot2) # for creating beautiful data visualizations
+library(scales) # for customizing scales in data visualizations
+```
+
+Now, let's generate a synthetic, imbalanced dataset. `Caret` provides useful functions for generating data. The one we'll use is the `twoClassSim` function (which, as the name implies, generates two class data). We are going to generate a dataset containing 10000 observations described through 30 variables. 20 out of these variables are relevant (linearly important variables), while the remaining 10 are noisy and irrelevant ones.
+
+After the data is generated, we split it into a train dataset (70% of the dataset) and test dataset (30% of our data). Notice that we use a `Caret` function (`createDataPartition`) to do the split. The function will try to balance the class distributions within splits.
+
+```{r}
+set.seed(3784)
+# generate 10000 observations 
+data <- twoClassSim(n = 10000, # number of observations
+                    intercept = 18, # controls the class imbalance
+                    linearVars = 20, # number of linearly important effects (i.e., relevant variables)
+                    noiseVars = 10) # number of noise variables
+
+# split the data into train (70%) and test (30%) datasets
+train.idx <- createDataPartition(data$Class, p = .7, list = FALSE)
+train.data <- data[train.idx, ]
+test.data <- data[-train.idx, ]
+```
+
+Let's check our class distribution.
+
+```{r}
+table(data$Class)
+```
+
+We have indeed an extremely imbalanced dataset with `Class1` representing only 1.21% of the data and `Class2` the vast majority (98.79%).
+
+Before tackeling classification and training models, and in order to accelerate processing times, let's create a cluster of `R` processes that can run tasks in parallel.
+
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+```
+
+## A First Attempt: A GBM Model Using Accuracy as the Metric for Model Selection
+
+In this very first attempt, we are going to pretend to be naïve and ignorant about imbalanced binary classification problems. Therefore, we are going to train a model while using the classification accuracy as our model selection criterion and we will check our results without tuning the cutoff and keeping it at the default (0.5).
+
+First, let us specify the hyper-parameters grid that we are going to explore. Note that this is the same grid we will be using all along our tutorial.
+
+```{r}
+gbm.param.grid <- expand.grid(interaction.depth = c(1, 5, 9),
+                        shrinkage = c(.001, .01, .1),
+                        n.trees = 100,
+                        n.minobsinnode = c(10, 20))
+```
+
+Let's specify how training is going to be conducted for this rather naïve attempt. We will conduct 5-fold cross validation with one repeat (i.e., classic cross-validation).
+
+```{r}
+baseline.gbm.ctrl <- trainControl(method = "repeatedcv", 
+                         number = 5, # 5-fold cross-validation (just to go quicker)
+                         repeats = 1) # 1 repeat (i.e., equivalent to normal cross-validation)
+```
+
+Now, let's train our model. We indicate that we want a GBM model (`method = "gbm"`), specify our hyper-parameters grid and the train control object we just defined and that's it. Since we do not indicate how the models are going to be compared, `Caret` will use the classic model accuracy as its criterion.
+
+```{r}
+set.seed(3784)
+baseline.gbm.clf <- train(Class ~ .,
+                data = train.data,
+                method = "gbm",
+                trControl = baseline.gbm.ctrl,
+                tuneGrid = gbm.param.grid,
+                verbose = FALSE)
+```
+
+Since we're going to check confusion matrices so often, let's write a small function that determines the confusion matrix of a given classifier when it's applied on a given dataset with a given cutoff.
+
+```{r}
+confusion.matrix <- function(clf, data, cutoff = .5){
+  y.pred.prob <- predict(clf, data, type = 'prob')[, 'Class1'] # get probabilities for Class1
+  # assign "hard" memberships based on cutoffs
+  y.pred <- factor(ifelse(y.pred.prob >= cutoff,
+                          'Class1',
+                          'Class2'),
+                   levels = c('Class1', 'Class2'))
+  # print the confusion matrix
+  return(confusionMatrix(data = y.pred,
+                        reference = data$Class,
+                        mode = 'prec_recall'))
+}
+```
+
+Let's check what our naïvely trained classifier yields when applied to our test dataset.
+
+```{r}
+print(confusion.matrix(baseline.gbm.clf, test.data))
+```
+
+Arf! We only detect 6 out of 36 `Class1` cases. That's not very good.
+
+## Using an Appropriate Metric
+
+Let us start to do things properly. First things first, let us train a model using an appropriate metric. For the reasons evoked in my presentation, we are going to use the PR AUC (Precision-Recall Area Under Curve) instead of ROC AUC. In order to be able to do so in `Caret`, we need two things: (i) use the `prSummary` function to report results (this will report PR AUC, Recall, Precision and F1-Score results), and (ii) specify that training should report class probabilities. The other details remain unchanged (so we are still going to do 5-folds CV with one repeat).
+
+```{r}
+gbm.ctrl <- trainControl(method = "repeatedcv", 
+                         number = 5,
+                         repeats = 1,
+                         summaryFunction = prSummary, # we're going to use this summary function to be able to get PR AUC
+                         classProbs = TRUE) # and we're going to need class probabilities, not hard assignements to labels
+gbm.ctrl$seeds <- baseline.gbm.clf$control$seeds # extra precaution (i.e., paranoïa): use exact same folds for CV as before
+```
+
+And for the training, we explicitely specify that model selection must be based on AUC (PR AUC in the case of `prSummary`).
+
+```{r}
+set.seed(3784)
+prauc.gbm.clf <- train(Class ~ .,
+                data = train.data,
+                method = "gbm",
+                trControl = gbm.ctrl,
+                metric = 'AUC',
+                tuneGrid = gbm.param.grid,
+                verbose = FALSE)
+```
+
+We'll check our results later when we compare all our models.
+
+## Handling Class Imbalance Through Resampling
+
+Let's now focus on training models with different re-sampling strategies. In recent versions of `Caret` it is extremely easy to evaluate these strategies correctly. You only have to indicate to the `trainControl` object how you want te resample (through its `sampling` attribute) and it will conduct resampling correctly inside the CV loop (i.e., by keeping validation folds imbalanced and balancing only training folds).
+
+### Up-sampling
+
+```{r}
+gbm.ctrl$sampling <- 'up'
+up.gbm.clf <- train(Class ~ .,
+                data = train.data,
+                method = "gbm",
+                trControl = gbm.ctrl,
+                metric = 'AUC',
+                tuneGrid = gbm.param.grid,
+                verbose = FALSE)
+```
+
+### Down-sampling
+
+```{r}
+gbm.ctrl$sampling <- 'down'
+down.gbm.clf <- train(Class ~ .,
+                data = train.data,
+                method = "gbm",
+                trControl = gbm.ctrl,
+                metric = 'AUC',
+                tuneGrid = gbm.param.grid,
+                verbose = FALSE)
+```
+
+### SMOTE (Synthetic Minority Over-sampling TEchnique)
+
+```{r}
+gbm.ctrl$sampling <- 'smote'
+smote.gbm.clf <- train(Class ~ .,
+                data = train.data,
+                method = "gbm",
+                trControl = gbm.ctrl,
+                metric = 'AUC',
+                tuneGrid = gbm.param.grid,
+                verbose = FALSE)
+```
+
+# Handling Class Imbalance Through Class Weights
+
+An alternative to resampling is to do cost-sensitive learning, i.e., specifying class weights and penalizing differently errors that are committed on the minority class and the majority class. Notice that this is incompatible with re-sampling so we need to specify to our `trainControl` object that we no longer want to re-balance our data.
+
+Here, we are going to use a fairly simple and straightforward weighting strategy in which each class is weighted proportionally to the number of observations:
+
+$$
+\omega_{C_i} = 0.5 \times \frac{1}{\text{Number of observations in } C_i}~.
+$$
+The multiplication by 0.5 is so that the weights accross all the dataset sum to 1.
+
+```{r}
+gbm.ctrl$sampling <- NULL # no rebalancing
+# Calculate class weights based on their proportions
+class.weights <- ifelse(train.data$Class == 'Class1',
+                        .5 / table(train.data$Class)[1],
+                        .5 / table(train.data$Class)[2])
+
+weighted.gbm.clf <- train(Class ~ .,
+                          data = train.data,
+                          method = "gbm",
+                          weights = class.weights,
+                          trControl = gbm.ctrl,
+                          metric = 'AUC',
+                          tuneGrid = gbm.param.grid,
+                          verbose = FALSE)
+```
+
+Before proceeding to comparing our models, let's close our cluster of `R` processes as we no longer need it.
+
+```{r}
+stopCluster(cl)
+```
+
+# Model Comparison
+
+First let's establish a list of our classifiers:
+
+```{r}
+clf.list <- list('Baseline' = baseline.gbm.clf,
+                 'Basic PRAUC' = prauc.gbm.clf,
+                 'PRAUC + Up-sampling' = up.gbm.clf,
+                 'PRAUC + Down-sampling' = down.gbm.clf,
+                 'PRAUC + SMOTE' = smote.gbm.clf,
+                 'PRAUC + Weighting' = weighted.gbm.clf)
+```
+
+Let's write a function that calculates the PR AUC for a given classifier when applied to a given dataset.
+
+```{r}
+prauc <- function(clf, data){
+  y.pred.prob <- predict(clf, data, type = 'prob')
+  pr.curve(y.pred.prob[, 'Class1'][data$Class == 'Class1'],
+           y.pred.prob[, 'Class1'][data$Class == 'Class2'],
+           curve = TRUE)
+}
+```
+
+Now we are able to compare our models!
+
+```{r}
+clf.list %>% map(prauc, data = test.data) %>% map(function(res){ res$auc.integral})
+```
+
+We can also plot the PR curves of the different models.
+
+```{r, fig.height = 6, fig.width = 6, fig.alig = 'center', warning = FALSE}
+viz.data <- bind_rows(lapply(names(clf.list), function(clf.name){
+  prc <- prauc(clf.list[[clf.name]], test.data)$curve
+  return(data.frame(recall = prc[, 1], precision = prc[, 2], model = clf.name))
+}))
+
+viz <- ggplot(viz.data, aes(x = recall, y = precision, color = model, linetype = model)) +
+       geom_line(size = .8, alpha = .9) +
+       scale_x_continuous(name = 'Recall', breaks = seq(0, 1, .1)) +
+       scale_y_continuous(name = 'Precision', breaks = seq(0, 1, .1)) +
+       scale_color_brewer(name = 'Model', palette = 'Set2') +
+       scale_linetype_manual(name = 'Model', values = c(1, 2, 4, 1, 2, 4)) +
+       coord_fixed() +
+       theme_bw() +
+       theme(legend.position = c(.78, .78))
+print(viz)
+
+```
+
+```{r, fig.height = 4, fig.width = 10, fig.alig = 'center', warning = FALSE}
+viz.data <- bind_rows(lapply(names(clf.list), function(clf.name){
+  prc <- prauc(clf.list[[clf.name]], test.data)$curve
+  return(data.frame(recall = prc[, 1], precision = prc[, 2], model = clf.name))
+}))
+
+viz <- ggplot(viz.data, aes(x = recall, y = precision, color = model, linetype = model)) +
+       geom_line(size = .8, alpha = .9) +
+       facet_grid(. ~ model) +
+       scale_x_continuous(name = 'Recall', breaks = seq(0, 1, .2)) +
+       scale_y_continuous(name = 'Precision', breaks = seq(0, 1, .2)) +
+       scale_color_brewer(name = 'Model', palette = 'Set2') +
+       scale_linetype_manual(name = 'Model', values = c(1, 2, 4, 1, 2, 4)) +
+       coord_fixed() +
+       theme_bw() +
+       theme(legend.position = 'top')
+print(viz)
+
+```
+
+By adhering to only the strict minimum (i.e., using an appropriate metric, the PR AUC), we are able to select a better model than proceeding with the default classification accuracy metric.
+
+The different strategies have various effects (that are unknown a priori, you have to try and see which strategy works best on the data at hand). For instance, down sampling performed extremely poorly and it did even worse than the naïve baseline. SMOTE degraded the quality slightly w.r.t. not applying any strategy. The big winners are up sampling (which came first) followed by using class weights.
+
+Finally, let's optimize the cutoff of the winning classifier and see how it fares compared to the one we started with.
+
+Getting the best cutoff w.r.t. F1-score:
+
+```{r}
+up.gbm.pr.curve <- prauc(up.gbm.clf, test.data)$curve
+up.gbm.best.cutoff <- up.gbm.pr.curve[, 3][which.max((2*up.gbm.pr.curve[,1]*up.gbm.pr.curve[,2]) / (up.gbm.pr.curve[,1] + up.gbm.pr.curve[,2]))]
+```
+
+Let's recall the performance of our baseline classifier.
+
+```{r}
+print(confusion.matrix(baseline.gbm.clf, test.data))
+```
+
+And now, our top classifier.
+
+```{r}
+print(confusion.matrix(up.gbm.clf, test.data, cutoff = up.gbm.best.cutoff))
+```
